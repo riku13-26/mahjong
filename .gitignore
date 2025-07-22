@@ -1,0 +1,41 @@
+# ---- Logs / experiment artifacts ----
+wandb/
+checkpoints/
+runs/                 # TensorBoard など
+*.wandb
+*.log
+*.out
+
+# ---- Model / data ----
+*.pt
+*.pth
+*.ckpt
+*.npz
+*.npy
+data/
+datasets/
+
+# ---- Python cache ----
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pkl
+
+# ---- Notebooks cache ----
+.ipynb_checkpoints/
+
+# ---- Virtual env / build ----
+env/
+venv/
+.venv/
+pip-wheel-metadata/
+build/
+dist/
+*.egg-info/
+
+# ---- OS / Editor ----
+.DS_Store
+Thumbs.db
+.vscode/
+*.swp
