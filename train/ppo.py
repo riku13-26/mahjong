@@ -23,7 +23,7 @@ import torch.nn.functional as F
 from torch import nn, optim
 import wandb
 
-wandb.login(key='30415eab5bd136949a129584777bd8ecae4bd920')
+wandb.login(key='')
 
 # --- 自作モジュールのインポート ---
 from env_jpn.mahjong_env import MahjongEnv
