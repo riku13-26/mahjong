@@ -39,3 +39,11 @@ dist/
 Thumbs.db
 .vscode/
 *.swp
+wandb/
+checkpoints/
+env/
+*.pt
+*.pth
+__pycache__/
+.ipynb_checkpoints/
+
