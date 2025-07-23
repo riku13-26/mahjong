@@ -8,7 +8,7 @@
 * Model       : `models.cnn_res.MahjongActorCritic`
 * Algorithm   : PPO（クリッピング・GAE 付き）
 
-外部 RL ライブラリ（Stable‑Baselines 等）は使わず、
+外部 RL ライブラリ（Stable-Baselines 等）は使わず、
 **PPO の中身を読んで理解できる構成** にしてあります。
 """
 from __future__ import annotations
@@ -23,7 +23,7 @@ import torch.nn.functional as F
 from torch import nn, optim
 import wandb
 
-wandb.login(key='30415eab5bd136949a129584777bd8ecae4bd920')
+wandb.login()
 
 # --- 自作モジュールのインポート ---
 from env_jpn.mahjong_env import MahjongEnv
@@ -47,21 +47,21 @@ from models.cnn_res import MahjongActorCritic
 @dataclass
 class PPOConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    total_steps: int = 2_0000        # ←お好みで
-    update_every: int = 1_024        # バッファに貯めるステップ数
-    epochs: int = 4                  # policy update 更新エポック
-    batch_size: int = 256
-    gamma: float = 0.99
-    lam: float = 0.95                # GAE
-    clip_eps: float = 0.2
-    lr: float = 3e-4
-    vf_coef: float = 0.5
-    ent_coef: float = 0.01
-    max_grad_norm: float = 0.5
-    seed: int = 42
-    log_interval: int = 1_000
-    wandb_project: str = "mahjong-rl"
-    wandb_runname: str = "run_ppo_cnn"
+    total_steps: int = 20000         # 総学習ステップ数
+    update_every: int = 1024         # バッファに貯めるステップ数
+    epochs: int = 4                  # ポリシー更新のエポック数
+    batch_size: int = 256            # ミニバッチサイズ
+    gamma: float = 0.99              # 割引率
+    lam: float = 0.95                # GAE のラムダ値
+    clip_eps: float = 0.2            # PPO クリッピング係数
+    lr: float = 3e-4                 # 学習率
+    vf_coef: float = 0.5             # バリュー関数の損失係数
+    ent_coef: float = 0.01           # エントロピー正則化係数
+    max_grad_norm: float = 0.5       # 勾配クリッピングの最大ノルム
+    seed: int = 42                   # ランダムシード
+    log_interval: int = 1000         # ログ出力間隔
+    wandb_project: str = "mahjong-rl" # Weights & Biases プロジェクト名
+    wandb_runname: str = "run_ppo_cnn" # Weights & Biases 実行名
 
 
 # --------------------------------------------------------
@@ -70,26 +70,47 @@ class PPOConfig:
 class RolloutBuffer:
     """
     学習用サンプルを一時的に格納するクラス。
-
-    * store()        : ステップごとに観測・行動などを保存
-    * finish_path()  : エピソード or バッファ末端で呼び出し、GAE-Lambda で
-                        advantage とリターンを計算
-    * get()          : PPO 更新のための dict を返す（advantage は標準化済み）
+    
+    主な機能:
+    * store()        : ステップごとに観測・行動・報酬・価値などを保存
+    * finish_path()  : エピソード終了時やバッファが満杯時に呼び出し、
+                      GAE-Lambda アルゴリズムでAdvantage推定値とリターンを計算
+    * get()          : PPO 更新のための辞書を返す（Advantageは標準化済み）
     """
     def __init__(self, size: int, obs_shape: tuple[int, ...], device: str):
+        """
+        バッファの初期化
+        
+        Args:
+            size: バッファのサイズ（保存するステップ数）
+            obs_shape: 観測の形状（高さ、幅、チャンネル）
+            device: 計算デバイス（"cuda" または "cpu"）
+        """
         self.size = size
         self.device = device
-        self.obs_buf = torch.zeros((size, *obs_shape), dtype=torch.float32, device=device)
-        self.act_buf = torch.zeros(size, dtype=torch.int64, device=device)
-        self.logp_buf = torch.zeros(size, dtype=torch.float32, device=device)
-        self.rew_buf = torch.zeros(size, dtype=torch.float32, device=device)
-        self.done_buf = torch.zeros(size, dtype=torch.float32, device=device)
-        self.val_buf = torch.zeros(size, dtype=torch.float32, device=device)
-        self.adv_buf = torch.zeros(size, dtype=torch.float32, device=device)
-        self.ret_buf = torch.zeros(size, dtype=torch.float32, device=device)
-        self.ptr = 0
+        # 各種データを保存するテンソルバッファ
+        self.obs_buf = torch.zeros((size, *obs_shape), dtype=torch.float32, device=device)  # 観測
+        self.act_buf = torch.zeros(size, dtype=torch.int64, device=device)                 # 行動
+        self.logp_buf = torch.zeros(size, dtype=torch.float32, device=device)              # 行動の対数確率
+        self.rew_buf = torch.zeros(size, dtype=torch.float32, device=device)               # 報酬
+        self.done_buf = torch.zeros(size, dtype=torch.float32, device=device)              # 終了フラグ
+        self.val_buf = torch.zeros(size, dtype=torch.float32, device=device)               # 価値関数の推定値
+        self.adv_buf = torch.zeros(size, dtype=torch.float32, device=device)               # Advantage推定値
+        self.ret_buf = torch.zeros(size, dtype=torch.float32, device=device)               # リターン（価値の目標値）
+        self.ptr = 0  # 現在の書き込み位置
 
     def store(self, obs, act, logp, rew, done, val):
+        """
+        1ステップ分のデータをバッファに保存
+        
+        Args:
+            obs: 観測（状態）
+            act: 選択した行動
+            logp: その行動の対数確率
+            rew: 得られた報酬
+            done: エピソード終了フラグ
+            val: 価値関数の推定値
+        """
         idx = self.ptr
         self.obs_buf[idx] = obs
         self.act_buf[idx] = act
@@ -98,43 +119,73 @@ class RolloutBuffer:
         self.done_buf[idx] = done
         self.val_buf[idx] = val
         self.ptr += 1
+        return idx
+    
+    def update(self, idx: int, *, rew=None, done=None, val=None):
+        if rew  is not None: self.rew_buf[idx]  = rew
+        if done is not None: self.done_buf[idx] = done
+        if val  is not None: self.val_buf[idx]  = val
 
     def is_full(self):
+        """バッファが満杯かどうかをチェック"""
         return self.ptr >= self.size
 
-    # --------------------------------------------------------------------
-    # finish_path():
-    #   * GAE(λ)  (Generalized Advantage Estimation)
-    #       - TD 誤差 δ_t = r_t + γ V(s_{t+1}) − V(s_t)
-    #       - advantage A_t = Σ_{k=0}^{∞} (γλ)^k δ_{t+k}
-    #         すなわち λ で指数減衰させた “未来の TD 誤差” の総和
-    #
-    #   * TD 目標 (return) R_t = A_t + V(s_t)
-    #       - critic の教師信号として使用
-    #
-    #   ここではバッファ末端 (ptr) から逆順に計算し、
-    #   done=1 のステップではブートストラップを切っている。
-    # --------------------------------------------------------------------
     def finish_path(self, last_val: float, gamma: float, lam: float):
-        # GAE-Lambda で advantage と TD 目標を計算
-        rew = self.rew_buf.cpu().numpy()
-        val = self.val_buf.cpu().numpy()
-        done = self.done_buf.cpu().numpy()
+        """
+        GAE (Generalized Advantage Estimation) を使ってAdvantage推定値とリターンを計算
+        
+        GAEの仕組み:
+        1. TD誤差 δ_t = r_t + γ V(s_{t+1}) - V(s_t)
+        2. Advantage A_t = Σ_{k=0}^{∞} (γλ)^k δ_{t+k}
+           → λで指数減衰させた「未来のTD誤差」の総和
+        3. リターン R_t = A_t + V(s_t)
+           → 価値関数の学習目標として使用
+        
+        Args:
+            last_val: 最終状態での価値推定値（ブートストラップ用）
+            gamma: 割引率
+            lam: GAEのλパラメータ
+        """
+        # データをCPUに移してnumpy配列に変換（計算効率のため）
+        rew  = self.rew_buf[:self.ptr].cpu().numpy()
+        val  = self.val_buf[:self.ptr].cpu().numpy()
+        done = self.done_buf[:self.ptr].cpu().numpy()
         adv = np.zeros_like(rew)
+        
+        # 末尾から逆順にAdvantageを計算
         last_gae = 0.0
         for t in reversed(range(self.ptr)):
+            # エピソード終了時はブートストラップを切る
             mask = 1.0 - done[t]
+            # 次の状態の価値（最終ステップの場合は外部から与えられた値を使用）
             next_val = last_val if t == self.ptr - 1 else val[t + 1]
+            # TD誤差を計算
             delta = rew[t] + gamma * next_val * mask - val[t]
+            # GAEの再帰的計算
             last_gae = delta + gamma * lam * mask * last_gae
             adv[t] = last_gae
+        
+        # 計算結果をGPUに戻す
         self.adv_buf[:self.ptr] = torch.as_tensor(adv, device=self.device)
         self.ret_buf[:self.ptr] = self.adv_buf[:self.ptr] + self.val_buf[:self.ptr]
 
     def get(self):
-        assert self.is_full()
-        # advantage を標準化
+        """
+        PPO更新用のデータセットを取得
+        
+        Returns:
+            dict: 学習に必要なデータの辞書
+                - obs: 観測データ
+                - act: 行動データ
+                - old_logp: 古いポリシーでの行動の対数確率
+                - ret: リターン（価値関数の学習目標）
+                - adv: 標準化されたAdvantage推定値
+        """
+        assert self.is_full(), "バッファが満杯でないとデータを取得できません"
+        
+        # Advantageを標準化（学習の安定性向上のため）
         adv = (self.adv_buf - self.adv_buf.mean()) / (self.adv_buf.std() + 1e-8)
+        
         dataset = {
             "obs": self.obs_buf,
             "act": self.act_buf,
@@ -146,21 +197,38 @@ class RolloutBuffer:
 
 
 # --------------------------------------------------------
-# 補助関数 : 非合法手を -inf マスクして行動をサンプリング
+# 行動選択関数（非合法手のマスキング付き）
 # --------------------------------------------------------
 def select_action(model: nn.Module, obs_img: np.ndarray, legal_actions: list[int], device: str):
-    # obs_img : (H,W,C) float32
-    obs_t = torch.from_numpy(obs_img).to(device).unsqueeze(0)  # (1,H,W,C)
+    """
+    合法手のみから行動を選択する関数
+    
+    Args:
+        model: Actor-Criticモデル
+        obs_img: 観測画像 (H, W, C)
+        legal_actions: 合法手のリスト
+        device: 計算デバイス
+    
+    Returns:
+        tuple: (選択された行動, その行動の対数確率, 価値推定値)
+    """
+    # 観測をバッチ次元付きのテンソルに変換
+    obs_t = torch.from_numpy(obs_img).to(device).unsqueeze(0)  # (1, H, W, C)
+    
+    # モデルから行動確率と価値を取得
     logits, value = model(obs_t)
-    logits = logits.squeeze(0)
+    logits = logits.squeeze(0)  # バッチ次元を削除
 
-    # 非合法手は -inf にして除外
+    # 非合法手を-∞でマスクして除外
     mask = torch.full_like(logits, float('-inf'))
-    mask[legal_actions] = 0.0
+    mask[legal_actions] = 0.0  # 合法手のみ0（マスクなし）
     masked_logits = logits + mask
+    
+    # 確率分布を作成して行動をサンプリング
     dist = torch.distributions.Categorical(logits=masked_logits)
     act = dist.sample()
     logp = dist.log_prob(act)
+    
     return act.item(), logp.item(), value.item()
 
 
@@ -284,6 +352,7 @@ def train(cfg: PPOConfig):
 
     global_step = 0
     start_time = time.time()
+    last_idx = {0: None, 1: None}
 
     while global_step < cfg.total_steps:
         # --- ゲーム終了フラグが立っていたら環境をリセットして続行 ---
@@ -293,6 +362,8 @@ def train(cfg: PPOConfig):
             obs_img = env.encode_observation(obs_dict)
             continue
 
+        # obs_dict = env.draw_phase()
+
         legal = env._legal_actions(env.current_player)
         action, logp, value = select_action(model, obs_img, legal, cfg.device)
 
@@ -301,7 +372,7 @@ def train(cfg: PPOConfig):
         next_obs_img = env.encode_observation(next_obs_dict)
 
         # バッファへ保存
-        buffer.store(
+        idx = buffer.store(
             torch.from_numpy(obs_img).float().to(cfg.device),
             action,
             logp,
@@ -309,6 +380,14 @@ def train(cfg: PPOConfig):
             float(done),
             value,
         )
+        last_idx[env.current_player] = idx
+
+        # ロンの場合に一つ前の相手の行動をマイナスの報酬にする
+        if info.get('ron_win', False):
+            loser = 1 - env.current_player
+            pen = last_idx[loser]
+            if pen is not None:
+                buffer.update(pen, rew=buffer.rew_buf[pen] - 1.5)
 
         global_step += 1
         obs_img = next_obs_img
@@ -321,6 +400,28 @@ def train(cfg: PPOConfig):
         else:
             obs_dict = env.draw_phase()
             obs_img = env.encode_observation(obs_dict)
+
+            # draw が返す obs_dict に done / reward が入っている
+            # 流局 or ツモ和了
+            if obs_dict.get("done", False):
+                self_rew = obs_dict['reward']
+                opp_rew = obs_dict['opponent_reward']
+
+                # ① 現在プレイヤーの報酬 → 現在の行動(idx)へ
+                if idx is not None:
+                    buffer.update(idx, rew=buffer.rew_buf[idx] + self_rew, done=1.0)
+
+                # ② 相手プレイヤーの報酬 → 一つ前の相手行動へ
+                opp_pid  = 1 - env.current_player
+                idx_opp  = last_idx.get(opp_pid)
+                if idx_opp is not None:
+                    buffer.update(idx_opp, rew=buffer.rew_buf[idx_opp] + opp_rew)
+
+                # 環境をリセット
+                env.reset()
+                obs_dict = env.draw_phase()
+                obs_img = env.encode_observation(obs_dict)
+
 
         # ----- バッファ満杯で更新 -----
         if buffer.is_full():
