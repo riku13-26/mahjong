@@ -47,14 +47,14 @@ from models.cnn_res import MahjongActorCritic
 @dataclass
 class PPOConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    total_steps: int = 20000         # 総学習ステップ数
+    total_steps: int = 20000         # 総学習ステップ数ß
     update_every: int = 1024         # バッファに貯めるステップ数
     epochs: int = 4                  # ポリシー更新のエポック数
     batch_size: int = 256            # ミニバッチサイズ
-    gamma: float = 0.99              # 割引率
+    gamma: float = 0.995              # 割引率
     lam: float = 0.95                # GAE のラムダ値
-    clip_eps: float = 0.2            # PPO クリッピング係数
-    lr: float = 3e-4                 # 学習率
+    clip_eps: float = 0.5            # PPO クリッピング係数
+    lr: float = 2.5e-4                 # 学習率
     vf_coef: float = 0.5             # バリュー関数の損失係数
     ent_coef: float = 0.01           # エントロピー正則化係数
     max_grad_norm: float = 0.5       # 勾配クリッピングの最大ノルム
@@ -255,6 +255,8 @@ def ppo_update(model: nn.Module, optimizer: optim.Optimizer, data: dict, cfg: PP
     total_pg_loss = 0.0
     total_value_loss = 0.0
     total_entropy = 0.0
+    total_clip_frac = 0.0
+    total_approx_kl = 0.0
     total_batches = 0
 
     for _ in range(cfg.epochs):
@@ -274,6 +276,12 @@ def ppo_update(model: nn.Module, optimizer: optim.Optimizer, data: dict, cfg: PP
             surr1 = ratio * b_adv
             surr2 = torch.clamp(ratio, 1 - cfg.clip_eps, 1 + cfg.clip_eps) * b_adv
             pg_loss = -torch.min(surr1, surr2).mean()
+            
+            # Clip fraction: what fraction of the batch was clipped
+            clip_frac = torch.mean((torch.abs(ratio - 1) > cfg.clip_eps).float())
+            
+            # Approximate KL divergence
+            approx_kl = 0.5 * torch.mean((logp - b_old_logp) ** 2)
 
             value_loss = F.mse_loss(value, b_ret)
 
@@ -288,16 +296,22 @@ def ppo_update(model: nn.Module, optimizer: optim.Optimizer, data: dict, cfg: PP
             total_pg_loss += pg_loss.item()
             total_value_loss += value_loss.item()
             total_entropy += entropy.item()
+            total_clip_frac += clip_frac.item()
+            total_approx_kl += approx_kl.item()
             total_batches += 1
 
     avg_pg_loss = total_pg_loss / total_batches if total_batches > 0 else 0.0
     avg_value_loss = total_value_loss / total_batches if total_batches > 0 else 0.0
     avg_entropy = total_entropy / total_batches if total_batches > 0 else 0.0
+    avg_clip_frac = total_clip_frac / total_batches if total_batches > 0 else 0.0
+    avg_approx_kl = total_approx_kl / total_batches if total_batches > 0 else 0.0
 
     return {
         "pg_loss": avg_pg_loss,
         "value_loss": avg_value_loss,
         "entropy": avg_entropy,
+        "clip_frac": avg_clip_frac,
+        "approx_kl": avg_approx_kl,
     }
 
 
@@ -353,6 +367,7 @@ def train(cfg: PPOConfig):
     global_step = 0
     start_time = time.time()
     last_idx = {0: None, 1: None}
+    best_mean_return = float('-inf')
 
     while global_step < cfg.total_steps:
         # --- ゲーム終了フラグが立っていたら環境をリセットして続行 ---
@@ -432,16 +447,32 @@ def train(cfg: PPOConfig):
             metrics = ppo_update(model, optimizer, data, cfg)
             buffer.ptr = 0
             mean_ep_ret = data["ret"].mean().item()
-            mean_ep_len = (data["done"] if "done" in data else torch.tensor([])).float().mean().item() if "done" in data else 0.0
+            mean_ep_len = data["done"].sum().item() / cfg.update_every
+            adv_std = data["adv"].std().item()
             wandb.log(
                 {
                     **metrics,
                     "batch_avg_return": mean_ep_ret,
                     "buffer_mean_ep_return": mean_ep_ret,
                     "buffer_mean_ep_length": mean_ep_len,
+                    "adv_std": adv_std,
+                    "clip_frac": metrics["clip_frac"],
+                    "approx_kl": metrics["approx_kl"],
                 },
                 step=global_step
             )
+            
+            # Save best model based on buffer_mean_ep_return
+            if mean_ep_ret > best_mean_return:
+                best_mean_return = mean_ep_ret
+                os.makedirs("checkpoints", exist_ok=True)
+                torch.save({
+                    "model_state": model.state_dict(),
+                    "config": asdict(cfg),
+                    "best_return": best_mean_return,
+                    "global_step": global_step
+                }, "checkpoints/ppo_best.pt")
+                print(f"New best model saved! Return: {best_mean_return:.4f} at step {global_step}")
 
         # ----- ログ -----
         if global_step % cfg.log_interval == 0:
