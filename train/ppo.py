@@ -471,21 +471,23 @@ def train(cfg: PPOConfig):
 
         # ----- バッファ満杯で更新 -----
         if buffer.is_full():
-            # --- バッファ終端で両プレイヤー視点の V(s) を推定してブートストラップ ---
-            last_val = {}
+            # --- バッファ終端で両プレイヤー分の V(s) を推定してブートストラップ ---
+            last_val = {0: 0.0, 1: 0.0}
             with torch.no_grad():
-                for p in (0, 1):
-                    # プレイヤー p 視点の観測を取得
-                    # MahjongEnv には `encode_observation` と対になるユーティリティが想定される。
-                    # もし `get_obs_dict(p)` 等が無い場合は適宜置き換えてください。
-                    obs_p_dict = env.get_obs_dict(p)           # ← ★環境側の関数名に合わせる
-                    obs_p_img  = env.encode_observation(obs_p_dict)
-                    _, v_p = model(torch.from_numpy(obs_p_img)
-                                         .unsqueeze(0).to(cfg.device))
-                    last_val[p] = v_p.item()
+                # ① 現在手番プレイヤー: 直近の obs_img をそのまま評価
+                _, v_curr = model(torch.from_numpy(obs_img).unsqueeze(0).to(cfg.device))
+                last_val[env.current_player] = v_curr.item()
+
+                # ② 相手プレイヤー: 直前にバッファへ格納した観測を再評価
+                opp_pid = 1 - env.current_player
+                idx_opp = last_idx.get(opp_pid)
+                if idx_opp is not None:
+                    opp_obs = buffer.obs_buf[idx_opp].unsqueeze(0)  # (1, C, H, W)
+                    _, v_opp = model(opp_obs)
+                    last_val[opp_pid] = v_opp.item()
+                # idx_opp が無い（学習開始直後など）は 0.0 のまま
 
             buffer.finish_path(last_val, cfg.gamma, cfg.lam)
-                
             data = buffer.get()
             metrics = ppo_update(model, optimizer, data, cfg)
             buffer.ptr = 0
