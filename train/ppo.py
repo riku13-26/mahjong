@@ -28,6 +28,7 @@ wandb.login()
 # --- 自作モジュールのインポート ---
 from env_jpn.mahjong_env import MahjongEnv
 from models.cnn_res import MahjongActorCritic
+from train.evaluation import evaluate_vs_rule_based
 
 
 # --------------------------------------------------------
@@ -62,6 +63,12 @@ class PPOConfig:
     log_interval: int = 1000         # ログ出力間隔
     wandb_project: str = "mahjong-rl" # Weights & Biases プロジェクト名
     wandb_runname: str = "run_ppo_cnn" # Weights & Biases 実行名
+    
+    # 評価関連のパラメータ
+    eval_interval: int = 5000        # 評価実行間隔（ステップ数）
+    eval_games: int = 500            # 評価時の対戦回数
+    quick_eval_games: int = 10      # 高速評価の対戦回数
+    enable_evaluation: bool = True   # 評価機能の有効/無効
 
 
 # --------------------------------------------------------
@@ -311,7 +318,9 @@ def ppo_update(model: nn.Module, optimizer: optim.Optimizer, data: dict, cfg: PP
             clip_frac = torch.mean((torch.abs(ratio - 1) > cfg.clip_eps).float())
             
             # Approximate KL divergence
-            approx_kl = 0.5 * torch.mean((logp - b_old_logp) ** 2)
+            # approx_kl = 0.5 * torch.mean((logp - b_old_logp) ** 2)
+            approx_kl = (b_old_logp - logp).mean()
+
 
             value_loss = F.mse_loss(value, b_ret)
 
@@ -383,7 +392,7 @@ def train(cfg: PPOConfig):
     model = MahjongActorCritic(num_actions=17).to(cfg.device)
     optimizer = optim.Adam(model.parameters(), lr=cfg.lr)
 
-    wandb.watch(model, log="gradients", log_freq=100)
+    # wandb.watch(model, log="gradients", log_freq=100)
 
     env.reset()  # ← 追加: 山札と手牌を初期化
 
@@ -398,6 +407,8 @@ def train(cfg: PPOConfig):
     start_time = time.time()
     last_idx = {0: None, 1: None}
     best_mean_return = float('-inf')
+    best_win_rate = 0.0
+    last_eval_step = 0
 
     while global_step < cfg.total_steps:
         # --- ゲーム終了フラグが立っていたら環境をリセットして続行 ---
@@ -492,14 +503,14 @@ def train(cfg: PPOConfig):
             metrics = ppo_update(model, optimizer, data, cfg)
             buffer.ptr = 0
             mean_ep_ret = data["ret"].mean().item()
-            mean_ep_len = data["done"].sum().item() / cfg.update_every
+            # mean_ep_len = data["done"].sum().item() / cfg.update_every
             adv_std = data["adv"].std().item()
             wandb.log(
                 {
                     **metrics,
                     "batch_avg_return": mean_ep_ret,
                     "buffer_mean_ep_return": mean_ep_ret,
-                    "buffer_mean_ep_length": mean_ep_len,
+                    # "buffer_mean_ep_length": mean_ep_len,
                     "adv_std": adv_std,
                     "clip_frac": metrics["clip_frac"],
                     "approx_kl": metrics["approx_kl"],
@@ -518,6 +529,50 @@ def train(cfg: PPOConfig):
                     "global_step": global_step
                 }, "checkpoints/ppo_best.pt")
                 print(f"New best model saved! Return: {best_mean_return:.4f} at step {global_step}")
+
+            # --- ルールベースAIとの対戦評価 ---
+            if cfg.enable_evaluation and (global_step - last_eval_step) >= cfg.eval_interval:
+                print(f"Evaluating model at step {global_step}...")
+                eval_start = time.time()
+                
+                try:
+                    eval_result = evaluate_vs_rule_based(
+                        model, cfg.device, cfg.eval_games, seed=cfg.seed + global_step
+                    )
+                    
+                    eval_time = time.time() - eval_start
+                    win_rate = eval_result["model_win_rate"]
+                    
+                    # WandBにログ
+                    wandb.log({
+                        "eval/win_rate_vs_rule_based": win_rate,
+                        "eval/model_wins_as_player0": eval_result["model_wins_as_player0"],
+                        "eval/model_wins_as_player1": eval_result["model_wins_as_player1"],
+                        "eval/total_model_wins": eval_result["total_model_wins"],
+                        "eval/avg_game_length": eval_result["avg_game_length"],
+                        "eval/evaluation_time": eval_time,
+                    }, step=global_step)
+                    
+                    print(f"Evaluation completed: Win rate {win_rate:.3f} ({eval_result['total_model_wins']}/{cfg.eval_games} wins) in {eval_time:.1f}s")
+                    
+                    # 最高勝率のモデルを保存
+                    if win_rate > best_win_rate:
+                        best_win_rate = win_rate
+                        os.makedirs("checkpoints", exist_ok=True)
+                        torch.save({
+                            "model_state": model.state_dict(),
+                            "config": asdict(cfg),
+                            "best_win_rate": best_win_rate,
+                            "global_step": global_step,
+                            "eval_result": eval_result
+                        }, "checkpoints/ppo_best_winrate.pt")
+                        print(f"New best win rate model saved! Win rate: {best_win_rate:.3f} at step {global_step}")
+                    
+                    last_eval_step = global_step
+                    
+                except Exception as e:
+                    print(f"Evaluation failed: {e}")
+                    # 評価に失敗してもトレーニングは続行
 
         # ----- ログ -----
         if global_step % cfg.log_interval == 0:
