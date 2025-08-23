@@ -1,30 +1,50 @@
 #!/usr/bin/env python3
 """
-日本麻雀（簡易 1vs1）環境で Actor‑Critic Hedge (ACH) を学習するサンプル実装。
+日本麻雀（簡易 1vs1）環境で **Actor-Critic Hedge (ACH)** を学習するサンプル実装。
 
 PPO 実装 (train_ppo.py) との主な相違点
 --------------------------------------
 1. **ポリシー出力**
-   * モデルは行動ごとの **logit y(a|s)** を直接出力。
-   * 実際の方策 π は Hedge 係数 η を掛けた soft‑max で求める。
-2. **バッファに保存する追加情報**
-   * 選択した行動 a_t に対応する旧 logit **y_old** を保存。
-3. **ACH 更新 (ach_update)**
-   * 二重クリップ：
-       - **ratio** = π/π_old → PPO と同じ ε クリップ
-       - **logit 差**: Δy = y_new − y_old → 区間 [−l_th, l_th] にクリップ
-   * 損失
-       L = 
-       	− c · η · exp(Δy_clipped) · A
-       	+ vf_coef · value_loss
-       	− ent_coef · entropy
-4. **ハイパーパラメータ** (ACHConfig)
-   * hedge_eta      : 情報集合ごとの Hedge 係数 (単一エージェントなので定数扱い)
-   * logit_clip_eps : ロジット差クリップ幅 l_th
-   * c_regret       : 後悔重み c
+   * モデルは各行動の **logit y(a|s)** を直接出力。
+   * 実際の方策は **π(a|s) = softmax(η · ŷ(a|s))**（ŷ は各状態で平均を引いたロジット）で得る。  
+     ※Hedge 係数 η は温度（探索度）に相当。
 
-このファイルは **依存コード(train_ppo.py と同じモデル & 環境)** を想定している。
+2. **バッファに保存する追加情報**
+   * 当該ステップで選択した行動 a_t の **旧ロジット y_old(a_t|s_t)**（Δy計算用）
+   * さらに **π_old(a_t|s_t)**（比率 r 判定用）をスカラーで保存  
+     ※旧ロジットを全アクション分保存して π_old を再計算してもよい
+
+3. **ACH の更新 (ach_update)**
+   * **二重クリップによるゲート c ∈ {0,1}**：
+       - **PPO比率クリップ**：r = π(a_t|s_t)/π_old(a_t|s_t) が [1−ε, 1+ε] 内
+       - **ロジット差クリップ**：Δy = ŷ_new(a_t|s_t) − ŷ_old(a_t|s_t) を [−ℓ_th, ℓ_th] にクリップ
+     * A_t ≥ 0 では r < 1+ε かつ Δy < ℓ_th → c=1  
+       A_t < 0 では r > 1−ε かつ Δy > −ℓ_th → c=1  
+       それ以外は c=0（actor 勾配を流さない）
+   * **損失（ミニバッチ平均）**
+       L = 
+         − c · η · exp(Δy_clipped) · A_t
+         + vf_coef · ½ (V(s_t) − G_t)^2
+         − ent_coef · H[π(·|s_t)]
+     * 価値損失は MSE、エントロピーは最大化のため損失から減算
+
+4. **ハイパーパラメータ** (ACHConfig の例)
+   * hedge_eta       : Hedge 係数 η（定数でも状態依存でも可）
+   * clip_eps        : PPO 比率クリップ幅 ε
+   * logit_threshold : ロジット差クリップ幅 ℓ_th
+   * ent_coef        : エントロピー係数
+   * vf_coef         : 価値損失係数  
+   ※ c_regret のような“後悔重み”はゲート c と混同を招くため削除推奨
+
+実装メモ
+--------
+* ŷ は状態ごとに平均を0化してからクリップ・softmax に入れると数値が安定。
+* π_old(a_t|s_t) の保存は必須（選択行動だけで可）。旧ロジットを行動1つしか保存しない場合、π_old の再計算はできない点に注意。
+* エントロピーは H = −Σ_a π log π。損失では −ent_coef · H。
+
+このファイルは **train_ppo.py と同じモデル & 環境** を前提とするが、上記の追加保存項目と損失の変更が必要。
 """
+
 from __future__ import annotations
 import os
 import time
@@ -44,32 +64,41 @@ from env_jpn.mahjong_env import MahjongEnv
 from models.cnn_res import MahjongActorCritic
 from train.evaluation import evaluate_vs_rule_based
 
+NUM_ACTIONS = 17
+
 # --------------------------------------------------------
 # ACH のハイパーパラメータ
 # Actor-Critic Hedge アルゴリズム用の設定値を管理
 # --------------------------------------------------------
 @dataclass
 class ACHConfig:
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"  # 学習デバイス（GPU優先）
-    total_steps: int = 20000        # 総学習ステップ数
-    update_every: int = 1024        # モデル更新頻度（ステップ数）
-    epochs: int = 4                 # 1回の更新での学習エポック数
-    batch_size: int = 256           # ミニバッチサイズ
-    gamma: float = 0.995            # 割引率（将来報酬の重み）
-    lam: float = 0.95               # GAE（Generalized Advantage Estimation）のλ
-    hedge_eta: float = 1.0          # Hedge 係数 η(s)（定数近似）
-    c_regret: float = 1.0           # 後悔重み c（ACH特有）
-    lr: float = 2.5e-4              # 学習率（Adam optimizer用）
-    vf_coef: float = 0.5            # 価値関数損失の重み
-    ent_coef: float = 0.01          # エントロピー正則化の重み
-    max_grad_norm: float = 0.5      # 勾配クリッピングの最大ノルム
-    seed: int = 42                  # 乱数シード値
-    log_interval: int = 1000        # ログ出力間隔
-    wandb_project: str = "mahjong-rl"   # Weights & Biases プロジェクト名
-    wandb_runname: str = "run_ach_cnn"  # 実行名
-    clip_eps: float = 0.2                 # PPO比率クリップ（0.1–0.2 推奨）
-    logit_threshold: float = 6.0          # Logit Thresholding の l_th
-    use_eta_in_policy: bool = True        # π=softmax(η·y_tilde) を使う
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    total_steps: int = 20000
+    update_every: int = 1024
+    epochs: int = 4
+    batch_size: int = 256
+    gamma: float = 0.995
+    lam: float = 0.95
+
+    hedge_eta: float = 1.0           # η
+    clip_eps: float = 0.2            # PPO型 クリップ幅（ゲート判定用）
+    logit_threshold: float = 6.0     # ℓ_th（中心化後ロジットのクリップ幅）
+    use_eta_in_policy: bool = True
+
+    lr: float = 2.5e-4
+    vf_coef: float = 0.5
+    ent_coef: float = 0.01
+    max_grad_norm: float = 0.5
+
+    seed: int = 42
+    log_interval: int = 1000
+    wandb_project: str = "mahjong-rl"
+    wandb_runname: str = "run_ach_cnn"
+
+    # 評価系
+    enable_evaluation: bool = False
+    eval_interval: int = 5000
+    eval_games: int = 200
 
 # --------------------------------------------------------
 # ロールアウトバッファ (ACH 版)
@@ -77,7 +106,7 @@ class ACHConfig:
 # --------------------------------------------------------
 class ACHRolloutBuffer:
     """ ACH 用バッファ: 旧 logit も保存 """
-    def __init__(self, size: int, obs_shape: tuple[int, ...], device, num_actions: str):
+    def __init__(self, size: int, obs_shape: tuple[int, ...], device, num_actions: int):
         self.size = size        # バッファサイズ
         self.device = device    # 計算デバイス
         # 各種データバッファの初期化
@@ -197,31 +226,33 @@ def select_action(model: nn.Module, obs_img: np.ndarray, legal_actions: list[int
 # --------------------------------------------------------
 def ach_update(model: nn.Module, optimizer: optim.Optimizer, data: dict, cfg: ACHConfig):
     """
-    二重クリップ：
-      (1) PPO 比率クリップ
-      (2) Logit Thresholding（平均差し引き→±l_th）
+    ACH の更新：
+      - ロジットを中心化→±ℓ_th でクリップ
+      - Δy = y_new_selected - y_old_selected を計算し、±ℓ_th でクリップ
+      - ゲート c を (r と Δy と A の符号) で決定
+      - actor 損失:  - c * η * exp(Δy_clipped) * A
+      - value MSE と entropy を加えて最終損失
     """
-    # --- 展開 ---
     obs        = data["obs"]          # [N, ...]
     act        = data["act"]          # [N]
     old_logp   = data["old_logp"]     # [N]
-    # old_logit は今回は未使用（互換のため data には残しておいてOK）
+    old_logit  = data["old_logit"]    # [N]  ← これを使う
     ret        = data["ret"]          # [N]
     adv        = data["adv"]          # [N]
     legal_mask = data["legal_mask"]   # [N, A] bool
 
     N = obs.size(0)
-
-    # --- メトリクス ---
     metrics = {
-        "policy_loss": 0.0,
+        "actor_loss": 0.0,
         "value_loss": 0.0,
         "entropy": 0.0,
-        "ratio_clip_frac": 0.0,       # ratio がクリップ域を超えた割合
-        "approx_kl_quad": 0.0,        # 0.5 * E[(logp - old_logp)^2]
-        "approx_kl_old_new": 0.0,     # E[old_logp - logp]
-        "logit_thresh_hit": 0.0,      # |y_pre| が l_th に当たった比率（合法手のみ）
-        "illegal_prob_sum": 0.0,      # 非合法手に割り当てられた確率合計（理想は 0）
+        "gate_on_frac": 0.0,
+        "ratio_clip_frac": 0.0,
+        "approx_kl_quad": 0.0,
+        "approx_kl_old_new": 0.0,
+        "logit_thresh_hit": 0.0,
+        "delta_y_mean": 0.0,
+        "illegal_prob_sum": 0.0,
     }
     total_batches = 0
 
@@ -229,64 +260,77 @@ def ach_update(model: nn.Module, optimizer: optim.Optimizer, data: dict, cfg: AC
         idx = torch.randperm(N, device=cfg.device)
         for start in range(0, N, cfg.batch_size):
             b = idx[start:start+cfg.batch_size]
-            b_obs, b_act = obs[b], act[b]
+            b_obs        = obs[b]
+            b_act        = act[b]
             b_old_logp   = old_logp[b]
-            b_ret, b_adv = ret[b], adv[b]
-            b_legal_mask = legal_mask[b]  # [B, A] bool
+            b_old_logit  = old_logit[b]          # 旧 y（中心化&クリップ済みの選択成分）
+            b_ret        = ret[b]
+            b_adv        = adv[b]
+            b_legal_mask = legal_mask[b]
 
-            # --- Logit Thresholding（η 前） ---
-            logits, value = model(b_obs)         # logits:[B,A], value:[B] or [B,1]
-            y_pre = threshold_logits(logits, cfg.logit_threshold)
+            # --- 現在ロジット → 中心化 & クリップ（η 前）---
+            logits, value = model(b_obs)                    # logits:[B,A], value:[B] or [B,1]
+            y_pre = threshold_logits(logits, cfg.logit_threshold)   # [B,A]
 
-            # 分布用ロジット：η を掛けてから合法手以外を -inf
+            # 分布用ロジット（η を掛け、非合法手を -inf マスク）
             y_for_dist = cfg.hedge_eta * y_pre if cfg.use_eta_in_policy else y_pre
             minus_inf  = torch.full_like(y_for_dist, float('-inf'))
             y_masked   = torch.where(b_legal_mask, y_for_dist, minus_inf)
 
-            # --- 方策分布と確率比 ---
             dist = torch.distributions.Categorical(logits=y_masked)
-            logp = dist.log_prob(b_act)          # 新 logπ
-            ratio = torch.exp(logp - b_old_logp) # π_new / π_old
+            logp = dist.log_prob(b_act)                    # 新 logπ(a|s)
+            ratio = torch.exp(logp - b_old_logp)           # π_new / π_old  （ゲート判定に使用）
 
-            # --- PPO 比率クリップ（Clip #1）---
-            surr1 = ratio * b_adv
-            surr2 = torch.clamp(ratio, 1.0 - cfg.clip_eps, 1.0 + cfg.clip_eps) * b_adv
-            ppo_obj = torch.min(surr1, surr2)
+            # --- Δy の計算とクリップ ---
+            # y_new のうち選択行動成分を抽出
+            y_new_sel = y_pre.gather(1, b_act.unsqueeze(1)).squeeze(1)  # [B]
+            delta_y   = y_new_sel - b_old_logit                          # [B]
+            delta_y_clipped = torch.clamp(delta_y, -cfg.logit_threshold, cfg.logit_threshold)
 
-            # --- 損失（Δy 重みなし） ---
-            policy_loss = -(cfg.c_regret * ppo_obj).mean()
-            value       = value.squeeze(-1) if value.ndim == 2 else value
-            value_loss  = F.mse_loss(value, b_ret)
-            entropy     = dist.entropy().mean()
+            # --- ゲート c の決定（0/1）---
+            #  A>=0:  r < 1+ε  かつ  Δy <  ℓ_th
+            #  A< 0:  r > 1-ε  かつ  Δy > -ℓ_th
+            cond_pos = (b_adv >= 0) & (ratio < (1.0 + cfg.clip_eps)) & (delta_y <  cfg.logit_threshold)
+            cond_neg = (b_adv <  0) & (ratio > (1.0 - cfg.clip_eps)) & (delta_y > -cfg.logit_threshold)
+            gate_c   = (cond_pos | cond_neg).float()                     # [B]
 
-            loss = policy_loss + cfg.vf_coef * value_loss - cfg.ent_coef * entropy
+            # --- actor / value / entropy 損失 ---
+            actor_term = - gate_c * cfg.hedge_eta * torch.exp(delta_y_clipped) * b_adv
+            actor_loss = actor_term.mean()
+
+            value      = value.squeeze(-1) if value.ndim == 2 else value
+            value_loss = F.mse_loss(value, b_ret)
+            entropy    = dist.entropy().mean()
+
+            loss = actor_loss + cfg.vf_coef * value_loss - cfg.ent_coef * entropy
 
             optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
             optimizer.step()
 
-            # --- メトリクス更新 ---
+            # --- メトリクス ---
             with torch.no_grad():
                 clip_frac = ((ratio < 1.0 - cfg.clip_eps) | (ratio > 1.0 + cfg.clip_eps)).float().mean().item()
                 kl_quad   = (0.5 * (logp - b_old_logp).pow(2).mean()).item()
                 kl_on     = (b_old_logp - logp).mean().item()
 
                 legal_per_row = b_legal_mask.sum(dim=1).clamp_min(1)
-                # しきい値命中は合法手だけでカウント
                 thresh_hits = ((y_pre.abs() >= (cfg.logit_threshold - 1e-6)) & b_legal_mask).sum(dim=1)
                 logit_thresh_hit = (thresh_hits.float() / legal_per_row.float()).mean().item()
 
                 probs = dist.probs
                 illegal_prob_sum = (probs * (~b_legal_mask).float()).sum(dim=1).mean().item()
 
-            metrics["policy_loss"]       += policy_loss.item()
+            metrics["actor_loss"]        += actor_loss.item()
             metrics["value_loss"]        += value_loss.item()
             metrics["entropy"]           += entropy.item()
+            metrics["gate_on_frac"]      += gate_c.mean().item()
             metrics["ratio_clip_frac"]   += clip_frac
             metrics["approx_kl_quad"]    += kl_quad
             metrics["approx_kl_old_new"] += kl_on
             metrics["logit_thresh_hit"]  += logit_thresh_hit
+            metrics["delta_y_mean"]      += delta_y.mean().item()
             metrics["illegal_prob_sum"]  += illegal_prob_sum
 
             total_batches += 1
@@ -327,9 +371,9 @@ def train(cfg: ACHConfig):
     if torch.cuda.is_available():
         print("Using CUDA:", torch.cuda.get_device_name(0))
 
-    model = MahjongActorCritic(num_actions=17).to(cfg.device)  # Actor-Criticネットワーク
+    model = MahjongActorCritic(num_actions=NUM_ACTIONS).to(cfg.device)
     optimizer = optim.Adam(model.parameters(), lr=cfg.lr)      # オプティマイザ
-    wandb.watch(model, log="all", log_freq=100)                # モデル監視
+    # wandb.watch(model, log="gradients", log_freq=100)                # モデル監視
 
     # 環境の初期化と観測形状の取得
     env.reset()
@@ -338,8 +382,7 @@ def train(cfg: ACHConfig):
     obs_shape = obs_img.shape           # 観測の次元
 
     # 経験バッファの初期化
-    buffer = ACHRolloutBuffer(cfg.update_every, obs_shape, cfg.device, num_actions=17)
-
+    buffer = ACHRolloutBuffer(cfg.update_every, obs_shape, cfg.device, num_actions=NUM_ACTIONS)
 
     # 学習状態の管理変数
     global_step = 0                     # 総ステップ数
@@ -359,7 +402,8 @@ def train(cfg: ACHConfig):
             continue
 
         # 行動選択（現在プレイヤーの合法手から）
-        legal = env._legal_actions(env.current_player)
+        actor_player = env.current_player
+        legal = env._legal_actions(actor_player)
         action, logp, y_old_act, value, legal_mask = select_action(
             model, obs_img, legal, cfg.device, cfg
         )
@@ -379,11 +423,11 @@ def train(cfg: ACHConfig):
             value,
             legal_mask,    # ← 追加
         )
-        last_idx[env.current_player] = idx  # プレイヤーの最後のインデックス記録
+        last_idx[actor_player] = idx  # プレイヤーの最後のインデックス記録
 
         # ロン勝利時の敗者ペナルティ
         if info.get('ron_win', False):
-            loser = 1 - env.current_player  # 相手プレイヤー
+            loser = 1 - actor_player  # 相手プレイヤー
             pen = last_idx[loser]           # 敗者の最後のインデックス
             if pen is not None:
                 buffer.update(pen, rew=buffer.rew_buf[pen] - 1.5)  # ペナルティ追加
@@ -494,7 +538,7 @@ def train(cfg: ACHConfig):
                             "best_win_rate": best_win_rate,
                             "global_step": global_step,
                             "eval_result": eval_result
-                        }, "checkpoints/ppo_best_winrate.pt")
+                        }, "checkpoints/ach_best_winrate.pt")
                         print(f"New best win rate model saved! Win rate: {best_win_rate:.3f} at step {global_step}")
                     
                     last_eval_step = global_step
