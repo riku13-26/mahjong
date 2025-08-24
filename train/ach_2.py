@@ -23,7 +23,7 @@ PPO 実装 (train_ppo.py) との主な相違点
        それ以外は c=0（actor 勾配を流さない）
    * **損失（ミニバッチ平均）**
        L = 
-         − c · η · exp(Δy_clipped) · A_t
+         − c · η · y · π_old · A_t
          + vf_coef · ½ (V(s_t) − G_t)^2
          − ent_coef · H[π(·|s_t)]
      * 価値損失は MSE、エントロピーは最大化のため損失から減算
@@ -81,9 +81,10 @@ class ACHConfig:
     lam: float = 0.95
 
     hedge_eta: float = 1.0           # η
-    clip_eps: float = 0.2            # PPO型 クリップ幅（ゲート判定用）
+    clip_eps: float = 0.5            # PPO型 クリップ幅（ゲート判定用）
     logit_threshold: float = 6.0     # ℓ_th（中心化後ロジットのクリップ幅）
-    use_eta_in_policy: bool = True
+    use_eta_in_policy: bool = False
+    logit_hit_coef: float = 1.0   # logit_thresh_hit の判定係数
 
     lr: float = 2.5e-4
     vf_coef: float = 0.5
@@ -226,76 +227,107 @@ def select_action(model: nn.Module, obs_img: np.ndarray, legal_actions: list[int
 # --------------------------------------------------------
 def ach_update(model: nn.Module, optimizer: optim.Optimizer, data: dict, cfg: ACHConfig):
     """
-    ACH の更新：
-      - ロジットを中心化→±ℓ_th でクリップ
-      - Δy = y_new_selected - y_old_selected を計算し、±ℓ_th でクリップ
-      - ゲート c を (r と Δy と A の符号) で決定
-      - actor 損失:  - c * η * exp(Δy_clipped) * A
-      - value MSE と entropy を加えて最終損失
+    ACH の更新（論文準拠の実装）
+
+    ポイント
+    --------
+    1) 出力ロジット y を「中心化 y_centered = y - ȳ」し，さらに数値安定のため
+       y_pre = clip(y_centered, ±ℓ_th) を方策分布生成に使う（threshold_logits が担当）
+
+    2) ゲート c の判定は「選択行動の 非クリップ中心化ロジット y_centered_sel」と
+       比率 r = π/π_old の二重条件（A>=0 と A<0 で上下側を切り替え）
+
+    3) actor 損失の主項は論文式(29):
+           L_actor = - E[ c · η · ( y_sel / π_old ) · A ]
+       ※ ここで y_sel は y_pre の選択成分（中心化＋クリップ後）を使用するのが実装上安定
+
+    4) メトリクス logit_thresh_hit は「選択行動の |y - ȳ| が (coef*ℓ_th) を超えた率」。
+       coef は cfg.logit_hit_coef（既定 1.0）。不安定なら 0.95 等へ下げる。
+
+    5) 二重スケーリング注意：
+       cfg.use_eta_in_policy=True だと分布生成で y_pre に η を掛けます。
+       同時に L_actor 側でも η を掛けているため，二重適用になります。
+       論文に忠実にするなら use_eta_in_policy=False を推奨。
     """
-    obs        = data["obs"]          # [N, ...]
-    act        = data["act"]          # [N]
-    old_logp   = data["old_logp"]     # [N]
-    old_logit  = data["old_logit"]    # [N]  ← これを使う
-    ret        = data["ret"]          # [N]
-    adv        = data["adv"]          # [N]
-    legal_mask = data["legal_mask"]   # [N, A] bool
+    # --- バッチ展開 ---
+    obs        = data["obs"]        # [N, ...]
+    act        = data["act"]        # [N]
+    old_logp   = data["old_logp"]   # [N]
+    # old_logit は保持されているが，この論文準拠版では損失に直接は使わない
+    # （デバッグ用途で残しておくのは可）
+    # old_logit  = data["old_logit"] # [N]
+    ret        = data["ret"]        # [N]
+    adv        = data["adv"]        # [N]
+    legal_mask = data["legal_mask"] # [N, A] bool
 
     N = obs.size(0)
+
+    # --- ログ用メトリクス集計器 ---
     metrics = {
-        "actor_loss": 0.0,
-        "value_loss": 0.0,
-        "entropy": 0.0,
-        "gate_on_frac": 0.0,
-        "ratio_clip_frac": 0.0,
-        "approx_kl_quad": 0.0,
-        "approx_kl_old_new": 0.0,
-        "logit_thresh_hit": 0.0,
-        "delta_y_mean": 0.0,
-        "illegal_prob_sum": 0.0,
+        "actor_loss": 0.0,        # Actor 損失の平均
+        "value_loss": 0.0,        # Value 損失の平均
+        "entropy": 0.0,           # 方策エントロピー（探索度）
+        "gate_on_frac": 0.0,      # ゲート c=1 になった割合（=勾配が流れた割合）
+        "ratio_clip_frac": 0.0,   # PPO 比率 r がクリップ域を超えた割合
+        "approx_kl_quad": 0.0,    # KL 近似 (0.5 * (logp - old_logp)^2)
+        "approx_kl_old_new": 0.0, # KL 近似 (old_logp - logp) の平均
+        "logit_thresh_hit": 0.0,  # 選択行動の |y-ȳ| が (coef*ℓ_th) を跨いだ割合
+        "illegal_prob_sum": 0.0,  # 非合法手に割り当てられた確率の平均
     }
     total_batches = 0
 
     for _ in range(cfg.epochs):
         idx = torch.randperm(N, device=cfg.device)
         for start in range(0, N, cfg.batch_size):
-            b = idx[start:start+cfg.batch_size]
+            b = idx[start:start + cfg.batch_size]
+
             b_obs        = obs[b]
             b_act        = act[b]
             b_old_logp   = old_logp[b]
-            b_old_logit  = old_logit[b]          # 旧 y（中心化&クリップ済みの選択成分）
             b_ret        = ret[b]
             b_adv        = adv[b]
-            b_legal_mask = legal_mask[b]
+            b_legal_mask = legal_mask[b]   # [B, A]
 
-            # --- 現在ロジット → 中心化 & クリップ（η 前）---
-            logits, value = model(b_obs)                    # logits:[B,A], value:[B] or [B,1]
-            y_pre = threshold_logits(logits, cfg.logit_threshold)   # [B,A]
+            # ------------------------------------------
+            # 1) 現在ロジット取得：中心化版 & クリップ版を用意
+            # ------------------------------------------
+            logits, value = model(b_obs)   # logits:[B, A], value:[B] or [B,1]
 
-            # 分布用ロジット（η を掛け、非合法手を -inf マスク）
+            # 非クリップ中心化：ゲート判定用（そのままの y-ȳ）
+            y_centered = logits - logits.mean(dim=-1, keepdim=True)         # [B, A]
+            y_centered_sel = y_centered.gather(1, b_act.unsqueeze(1)).squeeze(1)  # [B]
+
+            # クリップ後：分布生成用（数値安定）
+            y_pre = threshold_logits(logits, cfg.logit_threshold)            # [B, A]
+            y_pre_sel = y_pre.gather(1, b_act.unsqueeze(1)).squeeze(1)       # [B]
+
+            # ------------------------------------------
+            # 2) 方策分布 π_new（合法手のみ活性）
+            # ------------------------------------------
             y_for_dist = cfg.hedge_eta * y_pre if cfg.use_eta_in_policy else y_pre
             minus_inf  = torch.full_like(y_for_dist, float('-inf'))
             y_masked   = torch.where(b_legal_mask, y_for_dist, minus_inf)
 
-            dist = torch.distributions.Categorical(logits=y_masked)
-            logp = dist.log_prob(b_act)                    # 新 logπ(a|s)
-            ratio = torch.exp(logp - b_old_logp)           # π_new / π_old  （ゲート判定に使用）
+            dist  = torch.distributions.Categorical(logits=y_masked)
+            logp  = dist.log_prob(b_act)                           # log π_new(a|s)
+            ratio = torch.exp(logp - b_old_logp)                   # r = π_new / π_old（ゲート判定用）
 
-            # --- Δy の計算とクリップ ---
-            # y_new のうち選択行動成分を抽出
-            y_new_sel = y_pre.gather(1, b_act.unsqueeze(1)).squeeze(1)  # [B]
-            delta_y   = y_new_sel - b_old_logit                          # [B]
-            delta_y_clipped = torch.clamp(delta_y, -cfg.logit_threshold, cfg.logit_threshold)
+            # ------------------------------------------
+            # 3) ゲート c（論文どおり）：y_centered_sel と r の二重条件
+            #     A>=0: r < 1+ε かつ  y_c <  ℓ_th
+            #     A< 0: r > 1-ε かつ  y_c > -ℓ_th
+            # ------------------------------------------
+            cond_pos = (b_adv >= 0) & (ratio < (1.0 + cfg.clip_eps)) & (y_centered_sel <  cfg.logit_threshold)
+            cond_neg = (b_adv <  0) & (ratio > (1.0 - cfg.clip_eps)) & (y_centered_sel > -cfg.logit_threshold)
+            gate_c   = (cond_pos | cond_neg).float()                           # [B]
 
-            # --- ゲート c の決定（0/1）---
-            #  A>=0:  r < 1+ε  かつ  Δy <  ℓ_th
-            #  A< 0:  r > 1-ε  かつ  Δy > -ℓ_th
-            cond_pos = (b_adv >= 0) & (ratio < (1.0 + cfg.clip_eps)) & (delta_y <  cfg.logit_threshold)
-            cond_neg = (b_adv <  0) & (ratio > (1.0 - cfg.clip_eps)) & (delta_y > -cfg.logit_threshold)
-            gate_c   = (cond_pos | cond_neg).float()                     # [B]
-
-            # --- actor / value / entropy 損失 ---
-            actor_term = - gate_c * cfg.hedge_eta * torch.exp(delta_y_clipped) * b_adv
+            # ------------------------------------------
+            # 4) 損失：式(29)の actor 主項 + 価値 MSE - エントロピー
+            #     L_actor = - E[ c · η · ( y_sel / π_old ) · A ]
+            #     ※ π_old は old_logp から復元
+            # ------------------------------------------
+            pi_old_sel = torch.exp(b_old_logp)                                  # [B]
+            actor_term = - gate_c * cfg.hedge_eta * (y_pre_sel / (pi_old_sel + 1e-8)) * b_adv
             actor_loss = actor_term.mean()
 
             value      = value.squeeze(-1) if value.ndim == 2 else value
@@ -309,15 +341,16 @@ def ach_update(model: nn.Module, optimizer: optim.Optimizer, data: dict, cfg: AC
             nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
             optimizer.step()
 
-            # --- メトリクス ---
+            # ------------------------------------------
+            # 5) メトリクス（選択成分ベース & 可変しきい係数）
+            # ------------------------------------------
             with torch.no_grad():
                 clip_frac = ((ratio < 1.0 - cfg.clip_eps) | (ratio > 1.0 + cfg.clip_eps)).float().mean().item()
                 kl_quad   = (0.5 * (logp - b_old_logp).pow(2).mean()).item()
                 kl_on     = (b_old_logp - logp).mean().item()
 
-                legal_per_row = b_legal_mask.sum(dim=1).clamp_min(1)
-                thresh_hits = ((y_pre.abs() >= (cfg.logit_threshold - 1e-6)) & b_legal_mask).sum(dim=1)
-                logit_thresh_hit = (thresh_hits.float() / legal_per_row.float()).mean().item()
+                # |y-ȳ| が (coef*ℓ_th) 以上か判定（coef=1.0 が基本。必要なら 0.95 等へ）
+                hit = (y_centered_sel.abs() >= (cfg.logit_hit_coef * cfg.logit_threshold)).float().mean().item()
 
                 probs = dist.probs
                 illegal_prob_sum = (probs * (~b_legal_mask).float()).sum(dim=1).mean().item()
@@ -329,21 +362,26 @@ def ach_update(model: nn.Module, optimizer: optim.Optimizer, data: dict, cfg: AC
             metrics["ratio_clip_frac"]   += clip_frac
             metrics["approx_kl_quad"]    += kl_quad
             metrics["approx_kl_old_new"] += kl_on
-            metrics["logit_thresh_hit"]  += logit_thresh_hit
-            metrics["delta_y_mean"]      += delta_y.mean().item()
+            metrics["logit_thresh_hit"]  += hit
             metrics["illegal_prob_sum"]  += illegal_prob_sum
 
             total_batches += 1
 
+    # --- バッチ平均に正規化 ---
     for k in metrics:
         metrics[k] /= max(total_batches, 1)
+
     return metrics
 
 
-def threshold_logits(y: torch.Tensor, lth: float) -> torch.Tensor:
+def threshold_logits(y: torch.Tensor, lth: float, eps: float = 1e-6) -> torch.Tensor:
     """各サンプルでロジット平均を引いてから ±lth にクリップ"""
     centered = y - y.mean(dim=-1, keepdim=True)           # 中心化: y - ȳ
+
+    std = centered.std(dim=-1, keepdim=True).clamp_min(eps)
+    z = centered / std
     return torch.clamp(centered, -lth, lth)               # しきい値クリップ
+    # return lth * torch.tanh(z / 1.0)  # ソフトクリップ
 
 # --------------------------------------------------------
 # 学習ループ
