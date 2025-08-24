@@ -86,10 +86,10 @@ NUM_ACTIONS = 17
 @dataclass
 class ACHConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    total_steps: int = 20000
-    update_every: int = 1024
-    epochs: int = 4
-    batch_size: int = 256
+    total_steps: int = 10_000_000
+    update_every: int = 8192
+    epochs: int = 2
+    batch_size: int = 8192
     gamma: float = 0.995
     lam: float = 0.95
 
@@ -98,6 +98,7 @@ class ACHConfig:
     logit_threshold: float = 6.0     # ℓ_th（中心化後ロジットのクリップ幅）
     use_eta_in_policy: bool = False
     logit_hit_coef: float = 1.0   # logit_thresh_hit の判定係数
+    use_soft_clip: bool = True   # Trueならソフトクリップ(tanh)、Falseならハードクリップ
 
     lr: float = 2.5e-4
     vf_coef: float = 0.5
@@ -110,9 +111,9 @@ class ACHConfig:
     wandb_runname: str = "run_ach_cnn"
 
     # 評価系
-    enable_evaluation: bool = False
-    eval_interval: int = 5000
-    eval_games: int = 200
+    enable_evaluation: bool = True
+    eval_interval: int = 50000
+    eval_games: int = 1000
 
 # --------------------------------------------------------
 # ロールアウトバッファ (ACH 版)
@@ -311,7 +312,7 @@ def ach_update(model: nn.Module, optimizer: optim.Optimizer, data: dict, cfg: AC
             y_centered_sel = y_centered.gather(1, b_act.unsqueeze(1)).squeeze(1)  # [B]
 
             # クリップ後：分布生成用（数値安定）
-            y_pre = threshold_logits(logits, cfg.logit_threshold)            # [B, A]
+            y_pre = threshold_logits(logits, cfg.logit_threshold, use_soft=cfg.use_soft_clip)            # [B, A]
             y_pre_sel = y_pre.gather(1, b_act.unsqueeze(1)).squeeze(1)       # [B]
 
             # ------------------------------------------
@@ -387,14 +388,15 @@ def ach_update(model: nn.Module, optimizer: optim.Optimizer, data: dict, cfg: AC
     return metrics
 
 
-def threshold_logits(y: torch.Tensor, lth: float, eps: float = 1e-6) -> torch.Tensor:
-    """各サンプルでロジット平均を引いてから ±lth にクリップ"""
-    centered = y - y.mean(dim=-1, keepdim=True)           # 中心化: y - ȳ
-
+def threshold_logits(y: torch.Tensor, lth: float, eps: float = 1e-6, use_soft: bool = False) -> torch.Tensor:
+    """中心化ロジットをハードorソフトクリップ"""
+    centered = y - y.mean(dim=-1, keepdim=True)
     std = centered.std(dim=-1, keepdim=True).clamp_min(eps)
     z = centered / std
-    return torch.clamp(centered, -lth, lth)               # しきい値クリップ
-    # return lth * torch.tanh(z / 1.0)  # ソフトクリップ
+    if use_soft:
+        return lth * torch.tanh(z)  # ソフトクリップ
+    else:
+        return torch.clamp(centered, -lth, lth)  # ハードクリップ
 
 # --------------------------------------------------------
 # 学習ループ
